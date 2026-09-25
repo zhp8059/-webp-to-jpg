@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-WebP 批量转 JPG 工具 (终极版 - 支持拖拽文件、双击预览、全面 pathlib、百分比画质描述)
+WebP 批量转 JPG 工具 (终极版 - 支持转换前效果预览)
 """
 
 import sys
 import json
 import re
+import io
 import subprocess
 import threading
 import multiprocessing
@@ -78,7 +79,6 @@ def convert_single(args):
     src = Path(src_str)
     dst = src.with_suffix(".jpg")
     
-    # 智能覆盖策略
     if dst.exists():
         if overwrite_strategy == "跳过同名文件":
             return (str(src), str(dst), "skipped", "文件已存在，跳过")
@@ -91,7 +91,6 @@ def convert_single(args):
                     break
                 counter += 1
     
-    # 文件占用检测
     try:
         with open(src, 'a+b') as f:
             pass
@@ -133,7 +132,6 @@ def convert_single(args):
         if "decoder" in err_msg.lower() or "webp" in err_msg.lower():
             err_msg = f"{err_msg} (可能是损坏或不支持的WebP编码)"
         
-        # 容错清理
         if dst.exists():
             try:
                 dst.unlink()
@@ -147,7 +145,7 @@ class WebpConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("WebP 批量转 JPG 工具 (终极版)")
-        self.root.geometry("920x720")
+        self.root.geometry("920x750")
         self.root.resizable(False, False)
         
         self.config = load_config()
@@ -159,7 +157,6 @@ class WebpConverterApp:
         self.delete_source = tk.BooleanVar(value=self.config.get("delete_source", True))
         self.cpu_cores = tk.StringVar(value=str(self.config.get("cores", multiprocessing.cpu_count())))
         
-        # 质量兼容性处理（平滑迁移旧配置）
         quality_val = self.config.get("quality", "高画质 (原图95%质量)")
         if quality_val not in QUALITY_MAP:
             if quality_val == "100" or "100" in quality_val:
@@ -177,18 +174,20 @@ class WebpConverterApp:
         
         self.quality = tk.StringVar(value=quality_val)
         self.overwrite = tk.StringVar(value=self.config.get("overwrite", "覆盖同名文件"))
+        self.overwrite.trace_add("write", self.on_option_change)
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
         # 1. 任务队列区
-        frame_queue = tk.LabelFrame(self.root, text=" 任务队列 (支持拖拽文件夹或 .webp 文件到此区域) ", font=("微软雅黑", 10), pady=5, padx=5)
+        frame_queue = tk.LabelFrame(self.root, text=" 任务队列 (支持拖拽文件夹或 .webp 文件) ", font=("微软雅黑", 10), pady=5, padx=5)
         frame_queue.pack(fill=tk.X, padx=15, pady=10)
         
-        self.listbox = tk.Listbox(frame_queue, height=6, font=("微软雅黑", 9), selectmode=tk.EXTENDED)
+        self.listbox = tk.Listbox(frame_queue, height=5, font=("微软雅黑", 9), selectmode=tk.EXTENDED)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        self.listbox.bind("<Double-Button-1>", self.preview_file)
+        # 双击触发“转换前对比预览”
+        self.listbox.bind("<Double-Button-1>", self.preview_conversion_effect)
         
         scrollbar = tk.Scrollbar(frame_queue, orient="vertical", command=self.listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -197,6 +196,7 @@ class WebpConverterApp:
         frame_queue_btns = tk.Frame(frame_queue)
         frame_queue_btns.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
         tk.Button(frame_queue_btns, text="添加文件/文件夹", font=("微软雅黑", 9), width=15, command=self.select_paths).pack(pady=2)
+        tk.Button(frame_queue_btns, text="预览效果", font=("微软雅黑", 9), width=15, fg="blue", command=self.preview_conversion_effect).pack(pady=2) # 新增按钮
         tk.Button(frame_queue_btns, text="移除选中", font=("微软雅黑", 9), width=15, command=self.remove_selected).pack(pady=2)
         tk.Button(frame_queue_btns, text="清空队列", font=("微软雅黑", 9), width=15, command=self.clear_queue).pack(pady=2)
 
@@ -217,9 +217,9 @@ class WebpConverterApp:
         row2 = tk.Frame(frame_options)
         row2.pack(fill=tk.X, pady=5)
         tk.Label(row2, text="JPG 质量:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
-        
-        # 宽度从 16 增大到 22，防止新文字被截断
-        ttk.Combobox(row2, textvariable=self.quality, values=QUALITY_OPTIONS, width=22, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
+        quality_combo = ttk.Combobox(row2, textvariable=self.quality, values=QUALITY_OPTIONS, width=22, state="readonly", font=("微软雅黑", 10))
+        quality_combo.pack(side=tk.LEFT, padx=5)
+        quality_combo.bind("<<ComboboxSelected>>", self.on_option_change) # 质量改变时自动重新预览
         
         tk.Label(row2, text="  覆盖策略:", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=(15, 0))
         ttk.Combobox(row2, textvariable=self.overwrite, values=["覆盖同名文件", "跳过同名文件", "重命名保存"], width=12, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
@@ -243,9 +243,10 @@ class WebpConverterApp:
 
         frame_left = tk.Frame(frame_bottom)
         frame_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
-        tk.Label(frame_left, text="运行日志 (成功/进度):", font=("微软雅黑", 10)).pack(anchor=tk.W)
+        tk.Label(frame_left, text="运行日志 (双击成功记录可对比转换前后):", font=("微软雅黑", 10)).pack(anchor=tk.W)
         self.log_text = scrolledtext.ScrolledText(frame_left, height=12, state='disabled', font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text.bind("<Double-Button-1>", self.on_log_double_click)
 
         frame_right = tk.Frame(frame_bottom)
         frame_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
@@ -258,6 +259,12 @@ class WebpConverterApp:
         self.error_text = scrolledtext.ScrolledText(frame_right, height=12, state='disabled', font=("Consolas", 9), fg="red")
         self.error_text.pack(fill=tk.BOTH, expand=True)
         self.error_text.bind("<Double-Button-1>", self.on_error_double_click)
+
+    def on_option_change(self, *args):
+        """当质量选项改变时，如果当前有选中文件，自动刷新预览"""
+        if self.listbox.curselection():
+            # 稍微延迟一下，防止频繁触发
+            self.root.after(300, self.preview_conversion_effect)
 
     # ================= 队列与拖拽操作 =================
     def on_drop(self, event):
@@ -301,34 +308,115 @@ class WebpConverterApp:
         self.file_queue.clear()
 
     # ================= 预览功能 =================
-    def preview_file(self, event):
+    def preview_conversion_effect(self, event=None):
+        """
+        转换前预览：在内存中模拟当前质量参数的转换效果，不实际写文件
+        """
         selected = self.listbox.curselection()
-        if not selected: return
-        file_path = self.file_queue[selected[0]]
+        if not selected:
+            if not self.file_queue:
+                messagebox.showinfo("提示", "任务队列为空，请先添加文件。")
+                return
+            # 如果没有选中，默认预览第一个
+            index = 0
+            self.listbox.selection_set(0)
+        else:
+            index = selected[0]
+
+        src_path = self.file_queue[index]
         
-        if not file_path.exists():
-            messagebox.showerror("预览失败", f"文件不存在：\n{file_path}")
+        if not src_path.exists():
+            messagebox.showerror("预览失败", f"文件不存在：\n{src_path}")
             return
 
         try:
-            img = Image.open(file_path)
-            img.thumbnail((800, 600))
+            # 1. 读取原图
+            img_orig = Image.open(src_path)
+            img_orig.load()
             
+            # 获取原图尺寸（用于展示）
+            orig_w, orig_h = img_orig.size
+            orig_size_kb = src_path.stat().st_size / 1024
+
+            # 2. 生成模拟转换后的 JPG 字节流
+            # 注意：这里需要和后台转换逻辑保持一致的透明背景处理
+            im_sim = img_orig.copy()
+            if im_sim.mode in ("RGBA", "LA") or (im_sim.mode == "P" and "transparency" in im_sim.info):
+                im_sim = im_sim.convert("RGBA")
+                bg = Image.new("RGB", im_sim.size, (255, 255, 255))
+                bg.paste(im_sim, mask=im_sim.split()[-1])
+                im_sim = bg
+            else:
+                im_sim = im_sim.convert("RGB")
+
+            quality_num = QUALITY_MAP.get(self.quality.get(), 95)
+            
+            # 写入内存缓冲区
+            buffer = io.BytesIO()
+            save_kwargs = {"format": "JPEG", "quality": int(quality_num), "optimize": True}
+            im_sim.save(buffer, **save_kwargs)
+            buffer.seek(0)
+            
+            # 获取模拟转换后的文件大小
+            sim_size_kb = len(buffer.getvalue()) / 1024
+
+            # 3. 生成缩略图用于界面展示
+            img_orig.thumbnail((400, 400))
+            # 重新从 buffer 读取模拟图
+            img_sim_display = Image.open(buffer)
+            img_sim_display.thumbnail((400, 400))
+
+            # 4. 构建预览窗口
             top = tk.Toplevel(self.root)
-            top.title(f"预览 - {file_path.name}")
-            top.geometry("820x650")
+            top.title(f"转换效果预览 - {src_path.name}")
+            top.geometry("900x600")
+            top.resizable(False, False)
             
-            tk_img = ImageTk.PhotoImage(img)
-            lbl = tk.Label(top, image=tk_img)
-            lbl.image = tk_img
-            lbl.pack(padx=10, pady=10, expand=True)
+            # 左侧：原图
+            frame_left = tk.Frame(top, relief=tk.GROOVE, borderwidth=1)
+            frame_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+            tk.Label(frame_left, text="原图 (WebP)", font=("微软雅黑", 12, "bold"), fg="blue").pack(pady=5)
+            tk_img_orig = ImageTk.PhotoImage(img_orig)
+            lbl_orig = tk.Label(frame_left, image=tk_img_orig)
+            lbl_orig.image = tk_img_orig
+            lbl_orig.pack(expand=True)
             
-            file_size_kb = file_path.stat().st_size / 1024
-            info_text = f"尺寸: {img.width} x {img.height} | 大小: {file_size_kb:.1f} KB"
-            tk.Label(top, text=info_text, font=("微软雅黑", 10)).pack(pady=5)
+            orig_info = f"尺寸: {orig_w}x{orig_h} | 大小: {orig_size_kb:.1f} KB"
+            tk.Label(frame_left, text=orig_info, font=("微软雅黑", 9)).pack(pady=5)
             
+            # 右侧：模拟转换后
+            frame_right = tk.Frame(top, relief=tk.GROOVE, borderwidth=1)
+            frame_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+            tk.Label(frame_right, text=f"预览效果 (JPG - {self.quality.get()})", font=("微软雅黑", 12, "bold"), fg="green").pack(pady=5)
+            tk_img_sim = ImageTk.PhotoImage(img_sim_display)
+            lbl_sim = tk.Label(frame_right, image=tk_img_sim)
+            lbl_sim.image = tk_img_sim
+            lbl_sim.pack(expand=True)
+            
+            sim_info = f"尺寸: {orig_w}x{orig_h} | 预估大小: {sim_size_kb:.1f} KB"
+            tk.Label(frame_right, text=sim_info, font=("微软雅黑", 9)).pack(pady=5)
+            
+            # 底部：压缩率统计与提示
+            bottom_frame = tk.Frame(top)
+            bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+            
+            if orig_size_kb > 0:
+                ratio = (1 - sim_size_kb / orig_size_kb) * 100
+                if ratio >= 0:
+                    info = f"预估体积缩减 {ratio:.1f}%"
+                    color = "blue"
+                else:
+                    info = f"预估体积增大 {abs(ratio):.1f}%"
+                    color = "red"
+                tk.Label(bottom_frame, text=info, font=("微软雅黑", 12, "bold"), fg=color).pack()
+            
+            tk.Label(bottom_frame, text="* 注：此为内存模拟预览，与最终实际转换结果可能存在细微差异。", font=("微软雅黑", 8), fg="gray").pack(pady=(5, 0))
+            
+            # 关闭时释放内存
+            top.bind("<Destroy>", lambda e: buffer.close() if not buffer.closed else None)
+
         except Exception as e:
-            messagebox.showerror("预览失败", f"无法预览该文件：\n{e}")
+            messagebox.showerror("预览失败", f"无法生成预览效果：\n{e}")
 
     # ================= 日志与导出 =================
     def log_info(self, message):
@@ -366,6 +454,80 @@ class WebpConverterApp:
                 messagebox.showinfo("成功", "日志已成功导出！")
             except Exception as e:
                 messagebox.showerror("错误", f"导出日志失败: {e}")
+
+    def on_log_double_click(self, event):
+        """双击左侧成功日志，触发对比预览（实际已转换的文件）"""
+        try:
+            index = self.log_text.index(f"@{event.x},{event.y}")
+            line_num = int(index.split('.')[0])
+            line_text = self.log_text.get(f"{line_num}.0", f"{line_num}.end")
+            
+            match = re.search(r'✓ 成功: (.*?) -> (.*?)$', line_text)
+            if match:
+                src_path_str = match.group(1).strip()
+                dst_path_str = match.group(2).strip()
+                # 复用对比窗口逻辑
+                self.show_comparison(src_path_str, dst_path_str)
+        except Exception:
+            pass
+
+    def show_comparison(self, src_path_str, dst_path_str):
+        """显示已经转换完成的前后对比"""
+        src_path = Path(src_path_str)
+        dst_path = Path(dst_path_str)
+        
+        if not src_path.exists() or not dst_path.exists():
+            messagebox.showerror("预览失败", "源文件或目标文件不存在，无法对比。")
+            return
+            
+        try:
+            img_src = Image.open(src_path)
+            img_dst = Image.open(dst_path)
+            
+            img_src.thumbnail((400, 400))
+            img_dst.thumbnail((400, 400))
+            
+            top = tk.Toplevel(self.root)
+            top.title("对比预览 - 原图 vs 转换后")
+            top.geometry("900x600")
+            top.resizable(False, False)
+            
+            frame_left = tk.Frame(top, relief=tk.GROOVE, borderwidth=1)
+            frame_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+            tk.Label(frame_left, text="原图 (WebP)", font=("微软雅黑", 12, "bold"), fg="blue").pack(pady=5)
+            tk_img_src = ImageTk.PhotoImage(img_src)
+            lbl_src = tk.Label(frame_left, image=tk_img_src)
+            lbl_src.image = tk_img_src
+            lbl_src.pack(expand=True)
+            
+            src_size = src_path.stat().st_size / 1024
+            src_info = f"尺寸: {img_src.width}x{img_src.height} | 大小: {src_size:.1f} KB"
+            tk.Label(frame_left, text=src_info, font=("微软雅黑", 9)).pack(pady=5)
+            
+            frame_right = tk.Frame(top, relief=tk.GROOVE, borderwidth=1)
+            frame_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+            tk.Label(frame_right, text="转换后 (JPG)", font=("微软雅黑", 12, "bold"), fg="green").pack(pady=5)
+            tk_img_dst = ImageTk.PhotoImage(img_dst)
+            lbl_dst = tk.Label(frame_right, image=tk_img_dst)
+            lbl_dst.image = tk_img_dst
+            lbl_dst.pack(expand=True)
+            
+            dst_size = dst_path.stat().st_size / 1024
+            dst_info = f"尺寸: {img_dst.width}x{img_dst.height} | 大小: {dst_size:.1f} KB"
+            tk.Label(frame_right, text=dst_info, font=("微软雅黑", 9)).pack(pady=5)
+            
+            if src_size > 0:
+                ratio = (1 - dst_size / src_size) * 100
+                if ratio >= 0:
+                    info = f"实际体积压缩了 {ratio:.1f}%"
+                    color = "blue"
+                else:
+                    info = f"实际体积增大了 {abs(ratio):.1f}%"
+                    color = "red"
+                tk.Label(top, text=info, font=("微软雅黑", 12, "bold"), fg=color).pack(side=tk.BOTTOM, pady=10)
+                
+        except Exception as e:
+            messagebox.showerror("预览失败", f"无法打开图片进行对比：\n{e}")
 
     def on_error_double_click(self, event):
         try:
@@ -468,7 +630,7 @@ class WebpConverterApp:
                     src_path = Path(src_path_str)
                     
                     if status == "success":
-                        self.log_info(f"✓ 成功: {src_path.name} -> {Path(dst_path_str).name}")
+                        self.log_info(f"✓ 成功: {src_path_str} -> {dst_path_str}")
                         success_count += 1
                     elif status == "skipped":
                         self.log_info(f"➖ 跳过: {src_path.name}")
