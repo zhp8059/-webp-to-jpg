@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-WebP 批量转 JPG 工具 (带图形界面、多核加速、独立错误日志版)
+WebP 批量转 JPG 工具 (带图形界面、多核加速、独立错误日志、容错版)
 """
 
 import os
@@ -13,7 +13,9 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 from pathlib import Path
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageFile
+    # 尝试加载截断的图片，防止因文件损坏报错
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
 except ImportError:
     messagebox.showerror("缺少依赖", "请先安装 Pillow 库：\npip install Pillow")
     sys.exit(1)
@@ -27,6 +29,12 @@ def convert_single(args):
     
     try:
         with Image.open(src) as im:
+            # 尝试定位到第一帧（兼容动画 WebP）
+            try:
+                im.seek(0)
+            except Exception:
+                pass
+            
             im.load()
             icc = im.info.get("icc_profile")
 
@@ -49,14 +57,18 @@ def convert_single(args):
 
         return (src.name, dst.name, True, "")
     except Exception as e:
-        return (src.name, "", False, str(e))
+        err_msg = str(e)
+        # 针对 WebP 解码错误给出更友好的提示
+        if "decoder" in err_msg.lower() or "webp" in err_msg.lower():
+            err_msg = f"{err_msg} (可能是文件损坏、采用了不支持的WebP编码，或是一个动画WebP)"
+        return (src.name, "", False, err_msg)
 
 # ================= GUI 主程序 =================
 class WebpConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("WebP 批量转 JPG 工具 (多核加速版)")
-        self.root.geometry("800x550") # 增加窗口宽度以容纳左右两个日志框
+        self.root.geometry("800x550")
         self.root.resizable(False, False)
         
         self.max_cores = multiprocessing.cpu_count()
@@ -91,7 +103,7 @@ class WebpConverterApp:
         self.start_btn = tk.Button(frame_mid, text="开始转换", bg="#4CAF50", fg="white", width=15, font=("微软雅黑", 10, "bold"), command=self.start_conversion)
         self.start_btn.pack(side=tk.RIGHT)
 
-        # 3. 日志区域 (改为左右分栏)
+        # 3. 日志区域 (左右分栏)
         frame_bottom = tk.Frame(self.root, pady=10)
         frame_bottom.pack(fill=tk.BOTH, expand=True, padx=10)
 
@@ -113,7 +125,6 @@ class WebpConverterApp:
 
     # ================= 日志输出方法 =================
     def log_info(self, message):
-        """输出普通信息到左侧运行日志"""
         self.root.after(0, self._log_info, message)
 
     def _log_info(self, message):
@@ -123,7 +134,6 @@ class WebpConverterApp:
         self.log_text.config(state='disabled')
 
     def log_error(self, message):
-        """输出错误信息到右侧错误日志"""
         self.root.after(0, self._log_error, message)
 
     def _log_error(self, message):
@@ -153,7 +163,6 @@ class WebpConverterApp:
         self.is_running = True
         self.start_btn.config(state='disabled', text="转换中...")
         
-        # 清空两个日志框
         self.log_text.config(state='normal')
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state='disabled')
@@ -193,8 +202,8 @@ class WebpConverterApp:
                     self.log_info(f"✓ 成功: {src_name} -> {dst_name}")
                     success_count += 1
                 else:
-                    # 错误信息发往专用的错误日志框
-                    error_msg = f"✗ 失败: {src_name}\n   原因: {err}"
+                    # 将错误信息发往专用的错误日志框，并带上文件名
+                    error_msg = f"✗ 失败: {src_name}\n   原因: {err}\n"
                     self.log_error(error_msg)
                     fail_count += 1
 
