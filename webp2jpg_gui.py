@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-WebP 批量转 JPG 工具 (带图形界面、多核并发加速版)
+WebP 批量转 JPG 工具 (带图形界面、多核加速下拉菜单版)
 """
 
 import os
@@ -9,7 +9,7 @@ import threading
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+from tkinter import filedialog, messagebox, scrolledtext, ttk # 引入 ttk 控件库
 from pathlib import Path
 
 try:
@@ -59,40 +59,48 @@ class WebpConverterApp:
         self.root.geometry("650x520")
         self.root.resizable(False, False)
         
+        # 获取最大 CPU 核心数
+        self.max_cores = multiprocessing.cpu_count()
+        
         self.folder_path = tk.StringVar()
         self.delete_source = tk.BooleanVar(value=True)
-        self.cpu_cores = tk.IntVar(value=multiprocessing.cpu_count())
+        # 使用 StringVar 适配 Combobox
+        self.cpu_cores = tk.StringVar(value=str(self.max_cores))
         self.is_running = False
 
         self.create_widgets()
 
     def create_widgets(self):
         # 文件夹选择
-        frame_top = tk.Frame(self.root, pady=10)
+        frame_top = tk.Frame(self.root, pady=15)
         frame_top.pack(fill=tk.X, padx=10)
 
-        tk.Label(frame_top, text="目标文件夹:").pack(side=tk.LEFT)
-        tk.Entry(frame_top, textvariable=self.folder_path, width=45, state='readonly').pack(side=tk.LEFT, padx=5)
-        tk.Button(frame_top, text="选择文件夹", command=self.select_folder).pack(side=tk.LEFT)
+        tk.Label(frame_top, text="目标文件夹:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
+        tk.Entry(frame_top, textvariable=self.folder_path, width=45, state='readonly', font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
+        tk.Button(frame_top, text="选择文件夹", font=("微软雅黑", 10), command=self.select_folder).pack(side=tk.LEFT)
 
-        # 选项区域
-        frame_mid = tk.Frame(self.root, pady=5)
+        # 选项区域 (加大间距和字体，方便点击)
+        frame_mid = tk.Frame(self.root, pady=10)
         frame_mid.pack(fill=tk.X, padx=10)
         
-        tk.Checkbutton(frame_mid, text="转换成功后删除源文件", variable=self.delete_source).pack(side=tk.LEFT)
+        tk.Checkbutton(frame_mid, text="转换成功后删除源文件", variable=self.delete_source, font=("微软雅黑", 10)).pack(side=tk.LEFT)
         
-        tk.Label(frame_mid, text="  并发核心数:").pack(side=tk.LEFT)
-        tk.Spinbox(frame_mid, from_=1, to=multiprocessing.cpu_count(), textvariable=self.cpu_cores, width=4).pack(side=tk.LEFT)
+        tk.Label(frame_mid, text="  并发核心数:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
+        
+        # 【核心修改】将原来的 Spinbox 替换为 Combobox 下拉框，方便点选
+        core_values = [str(i) for i in range(1, self.max_cores + 1)]
+        self.core_combo = ttk.Combobox(frame_mid, textvariable=self.cpu_cores, values=core_values, width=4, state="readonly", font=("微软雅黑", 10))
+        self.core_combo.pack(side=tk.LEFT, padx=5)
 
-        self.start_btn = tk.Button(frame_mid, text="开始转换", bg="#4CAF50", fg="white", width=15, command=self.start_conversion)
+        self.start_btn = tk.Button(frame_mid, text="开始转换", bg="#4CAF50", fg="white", width=15, font=("微软雅黑", 10, "bold"), command=self.start_conversion)
         self.start_btn.pack(side=tk.RIGHT)
 
         # 日志区域
         frame_bottom = tk.Frame(self.root, pady=10)
         frame_bottom.pack(fill=tk.BOTH, expand=True, padx=10)
         
-        tk.Label(frame_bottom, text="转换日志:").pack(anchor=tk.W)
-        self.log_text = scrolledtext.ScrolledText(frame_bottom, height=18, state='disabled')
+        tk.Label(frame_bottom, text="转换日志:", font=("微软雅黑", 10)).pack(anchor=tk.W)
+        self.log_text = scrolledtext.ScrolledText(frame_bottom, height=16, state='disabled', font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
     def log(self, message):
@@ -129,7 +137,7 @@ class WebpConverterApp:
 
         threading.Thread(
             target=self.run_conversion, 
-            args=(folder, self.delete_source.get(), self.cpu_cores.get()), 
+            args=(folder, self.delete_source.get(), int(self.cpu_cores.get())), # 转成 int 传给后台
             daemon=True
         ).start()
 
