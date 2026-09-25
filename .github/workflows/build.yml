@@ -23,17 +23,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install pillow pyinstaller tkinterdnd2
 
-      - name: 下载并解压 UPX (用于压缩体积)
+      - name: 下载并解压 UPX
         run: |
           Invoke-WebRequest -Uri "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-win64.zip" -OutFile "upx.zip"
           Expand-Archive -Path "upx.zip" -DestinationPath "."
           mv upx-4.2.4-win64 upx
 
-      - name: 打包 exe (onedir 模式，启动更快)
+      - name: 打包 exe
         run: |
-          pyinstaller --onedir --noconsole --name WebpToJpg --clean --collect-all PIL --hidden-import PIL._webp --collect-all tkinterdnd2 --exclude-module PyQt5 --exclude-module PySide2 --exclude-module PIL.ImageQt --exclude-module PIL.ImageTk --upx-dir ./upx webp2jpg_gui.py
+          pyinstaller --onedir --noconsole --name WebpToJpg --clean --collect-all PIL --hidden-import PIL._webp --collect-all tkinterdnd2 --exclude-module PyQt5 --exclude-module PySide2 --upx-dir ./upx webp2jpg_gui.py
+        # 注意：去掉了 --exclude-module PIL.ImageTk，因为预览功能需要它
 
-      - name: 压缩为 ZIP (onedir 会产生一个文件夹，需要压缩上传)
+      - name: 压缩为 ZIP
         run: |
           Compress-Archive -Path dist/WebpToJpg/* -DestinationPath dist/WebpToJpg.zip
 
