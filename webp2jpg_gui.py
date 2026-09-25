@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-WebP 批量转 JPG 工具 (多任务队列终极版 - 文字化质量选项)
+WebP 批量转 JPG 工具 (终极版 - 支持拖拽文件、双击预览、全面 pathlib、百分比画质描述)
 """
 
-import os
 import sys
 import json
 import re
@@ -11,12 +10,12 @@ import subprocess
 import threading
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from pathlib import Path
 
 try:
-    from PIL import Image, ImageFile
+    from PIL import Image, ImageFile, ImageTk
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 except ImportError:
     messagebox.showerror("缺少依赖", "请先安装 Pillow 库：\npip install Pillow")
@@ -30,23 +29,22 @@ except ImportError:
 
 # ================= 质量映射配置 =================
 QUALITY_OPTIONS = [
-    "极高画质 (100)",
-    "高画质 (95)",
-    "中画质 (85)",
-    "低画质 (75)",
-    "极小体积 (60)"
+    "极高画质 (原图100%质量)",
+    "高画质 (原图95%质量)",
+    "中画质 (原图85%质量)",
+    "低画质 (原图75%质量)",
+    "极小体积 (原图60%质量)"
 ]
-
 QUALITY_MAP = {
-    "极高画质 (100)": 100,
-    "高画质 (95)": 95,
-    "中画质 (85)": 85,
-    "低画质 (75)": 75,
-    "极小体积 (60)": 60
+    "极高画质 (原图100%质量)": 100,
+    "高画质 (原图95%质量)": 95,
+    "中画质 (原图85%质量)": 85,
+    "低画质 (原图75%质量)": 75,
+    "极小体积 (原图60%质量)": 60
 }
 
 # ================= 配置文件管理 =================
-def get_config_path():
+def get_config_path() -> Path:
     if getattr(sys, 'frozen', False):
         base_dir = Path(sys.executable).parent
     else:
@@ -55,7 +53,7 @@ def get_config_path():
 
 CONFIG_FILE = get_config_path()
 
-def load_config():
+def load_config() -> dict:
     if CONFIG_FILE.exists():
         try:
             return json.loads(CONFIG_FILE.read_text(encoding='utf-8'))
@@ -64,11 +62,11 @@ def load_config():
     return {
         "delete_source": True,
         "cores": multiprocessing.cpu_count(),
-        "quality": "高画质 (95)",
+        "quality": "高画质 (原图95%质量)",
         "overwrite": "覆盖同名文件"
     }
 
-def save_config(config):
+def save_config(config: dict):
     try:
         CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=4), encoding='utf-8')
     except Exception:
@@ -148,41 +146,49 @@ def convert_single(args):
 class WebpConverterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("WebP 批量转 JPG 工具 (多任务队列终极版)")
+        self.root.title("WebP 批量转 JPG 工具 (终极版)")
         self.root.geometry("920x720")
         self.root.resizable(False, False)
         
         self.config = load_config()
-        self.folder_list = [] # 任务队列
-        
+        self.file_queue: list[Path] = []
+        self.is_running = False
+        self.cancel_event = threading.Event()
+        self.preview_image = None
+
         self.delete_source = tk.BooleanVar(value=self.config.get("delete_source", True))
         self.cpu_cores = tk.StringVar(value=str(self.config.get("cores", multiprocessing.cpu_count())))
         
-        # 处理配置中质量的兼容性（如果之前保存的是数字，转换为新文字）
-        quality_val = self.config.get("quality", "95")
-        if quality_val == "100": quality_val = "极高画质 (100)"
-        elif quality_val == "95": quality_val = "高画质 (95)"
-        elif quality_val == "85": quality_val = "中画质 (85)"
-        elif quality_val == "75": quality_val = "低画质 (75)"
-        elif quality_val == "60": quality_val = "极小体积 (60)"
-        elif quality_val not in QUALITY_MAP: quality_val = "高画质 (95)" # 兜底
+        # 质量兼容性处理（平滑迁移旧配置）
+        quality_val = self.config.get("quality", "高画质 (原图95%质量)")
+        if quality_val not in QUALITY_MAP:
+            if quality_val == "100" or "100" in quality_val:
+                quality_val = "极高画质 (原图100%质量)"
+            elif quality_val == "95" or "95" in quality_val:
+                quality_val = "高画质 (原图95%质量)"
+            elif quality_val == "85" or "85" in quality_val:
+                quality_val = "中画质 (原图85%质量)"
+            elif quality_val == "75" or "75" in quality_val:
+                quality_val = "低画质 (原图75%质量)"
+            elif quality_val == "60" or "60" in quality_val:
+                quality_val = "极小体积 (原图60%质量)"
+            else:
+                quality_val = "高画质 (原图95%质量)"
         
         self.quality = tk.StringVar(value=quality_val)
         self.overwrite = tk.StringVar(value=self.config.get("overwrite", "覆盖同名文件"))
-        
-        self.is_running = False
-        self.cancel_event = threading.Event()
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
         # 1. 任务队列区
-        frame_queue = tk.LabelFrame(self.root, text=" 任务队列 (支持拖拽文件夹到此区域) ", font=("微软雅黑", 10), pady=5, padx=5)
+        frame_queue = tk.LabelFrame(self.root, text=" 任务队列 (支持拖拽文件夹或 .webp 文件到此区域) ", font=("微软雅黑", 10), pady=5, padx=5)
         frame_queue.pack(fill=tk.X, padx=15, pady=10)
         
-        self.listbox = tk.Listbox(frame_queue, height=5, font=("微软雅黑", 9), selectmode=tk.EXTENDED)
+        self.listbox = tk.Listbox(frame_queue, height=6, font=("微软雅黑", 9), selectmode=tk.EXTENDED)
         self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        self.listbox.bind("<Double-Button-1>", self.preview_file)
         
         scrollbar = tk.Scrollbar(frame_queue, orient="vertical", command=self.listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -190,9 +196,9 @@ class WebpConverterApp:
         
         frame_queue_btns = tk.Frame(frame_queue)
         frame_queue_btns.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
-        tk.Button(frame_queue_btns, text="添加文件夹", font=("微软雅黑", 9), width=10, command=self.select_folder).pack(pady=2)
-        tk.Button(frame_queue_btns, text="移除选中", font=("微软雅黑", 9), width=10, command=self.remove_selected).pack(pady=2)
-        tk.Button(frame_queue_btns, text="清空队列", font=("微软雅黑", 9), width=10, command=self.clear_queue).pack(pady=2)
+        tk.Button(frame_queue_btns, text="添加文件/文件夹", font=("微软雅黑", 9), width=15, command=self.select_paths).pack(pady=2)
+        tk.Button(frame_queue_btns, text="移除选中", font=("微软雅黑", 9), width=15, command=self.remove_selected).pack(pady=2)
+        tk.Button(frame_queue_btns, text="清空队列", font=("微软雅黑", 9), width=15, command=self.clear_queue).pack(pady=2)
 
         if HAS_DND:
             self.listbox.drop_target_register(DND_FILES)
@@ -212,13 +218,13 @@ class WebpConverterApp:
         row2.pack(fill=tk.X, pady=5)
         tk.Label(row2, text="JPG 质量:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
         
-        # 注意这里：值使用 QUALITY_OPTIONS，宽度调整为 16 以容纳文字
-        ttk.Combobox(row2, textvariable=self.quality, values=QUALITY_OPTIONS, width=16, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
+        # 宽度从 16 增大到 22，防止新文字被截断
+        ttk.Combobox(row2, textvariable=self.quality, values=QUALITY_OPTIONS, width=22, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
         
         tk.Label(row2, text="  覆盖策略:", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=(15, 0))
         ttk.Combobox(row2, textvariable=self.overwrite, values=["覆盖同名文件", "跳过同名文件", "重命名保存"], width=12, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
 
-        # 3. 操作区 (进度条 + 按钮)
+        # 3. 操作区
         frame_action = tk.Frame(self.root, pady=10)
         frame_action.pack(fill=tk.X, padx=15)
 
@@ -255,32 +261,74 @@ class WebpConverterApp:
 
     # ================= 队列与拖拽操作 =================
     def on_drop(self, event):
-        files = self.root.tk.splitlist(event.data)
-        added = 0
-        for path in files:
-            if os.path.isdir(path):
-                if path not in self.folder_list:
-                    self.folder_list.append(path)
-                    self.listbox.insert(tk.END, path)
-                    added += 1
-        if added > 0:
-            self.log_info(f"已添加 {added} 个文件夹到任务队列")
+        paths = self.root.tk.splitlist(event.data)
+        files_to_add = []
+        
+        for p in paths:
+            path = Path(p)
+            if path.is_dir():
+                files_to_add.extend(list(path.rglob("*.webp")))
+            elif path.is_file() and path.suffix.lower() == ".webp":
+                files_to_add.append(path)
+                
+        if files_to_add:
+            self.add_paths_to_queue(files_to_add)
 
-    def select_folder(self):
-        folder = filedialog.askdirectory(title="选择包含 WebP 的文件夹")
-        if folder and folder not in self.folder_list:
-            self.folder_list.append(folder)
-            self.listbox.insert(tk.END, folder)
+    def select_paths(self):
+        files = filedialog.askopenfilenames(title="选择 WebP 文件", filetypes=[("WebP 图片", "*.webp")])
+        if files:
+            paths = [Path(f) for f in files]
+            self.add_paths_to_queue(paths)
+
+    def add_paths_to_queue(self, paths: list[Path]):
+        added = 0
+        for path in paths:
+            if path not in self.file_queue:
+                self.file_queue.append(path)
+                self.listbox.insert(tk.END, str(path))
+                added += 1
+        if added > 0:
+            self.log_info(f"已添加 {added} 个文件到任务队列")
 
     def remove_selected(self):
         selected = self.listbox.curselection()
         for index in reversed(selected):
             self.listbox.delete(index)
-            del self.folder_list[index]
+            del self.file_queue[index]
 
     def clear_queue(self):
         self.listbox.delete(0, tk.END)
-        self.folder_list.clear()
+        self.file_queue.clear()
+
+    # ================= 预览功能 =================
+    def preview_file(self, event):
+        selected = self.listbox.curselection()
+        if not selected: return
+        file_path = self.file_queue[selected[0]]
+        
+        if not file_path.exists():
+            messagebox.showerror("预览失败", f"文件不存在：\n{file_path}")
+            return
+
+        try:
+            img = Image.open(file_path)
+            img.thumbnail((800, 600))
+            
+            top = tk.Toplevel(self.root)
+            top.title(f"预览 - {file_path.name}")
+            top.geometry("820x650")
+            
+            tk_img = ImageTk.PhotoImage(img)
+            lbl = tk.Label(top, image=tk_img)
+            lbl.image = tk_img
+            lbl.pack(padx=10, pady=10, expand=True)
+            
+            file_size_kb = file_path.stat().st_size / 1024
+            info_text = f"尺寸: {img.width} x {img.height} | 大小: {file_size_kb:.1f} KB"
+            tk.Label(top, text=info_text, font=("微软雅黑", 10)).pack(pady=5)
+            
+        except Exception as e:
+            messagebox.showerror("预览失败", f"无法预览该文件：\n{e}")
 
     # ================= 日志与导出 =================
     def log_info(self, message):
@@ -311,11 +359,10 @@ class WebpConverterApp:
         )
         if file_path:
             try:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write("========== 运行日志 ==========\n")
-                    f.write(info_content + "\n\n")
-                    f.write("========== 错误日志 ==========\n")
-                    f.write(error_content + "\n")
+                Path(file_path).write_text(
+                    f"========== 运行日志 ==========\n{info_content}\n\n========== 错误日志 ==========\n{error_content}\n",
+                    encoding='utf-8'
+                )
                 messagebox.showinfo("成功", "日志已成功导出！")
             except Exception as e:
                 messagebox.showerror("错误", f"导出日志失败: {e}")
@@ -328,10 +375,9 @@ class WebpConverterApp:
             
             match = re.search(r'✗ 失败: (.*?)(?:\s*$)', line_text)
             if match:
-                path = match.group(1).strip()
-                path = os.path.normpath(path)
-                if os.path.exists(path):
-                    subprocess.Popen(f'explorer /select,"{path}"')
+                path = Path(match.group(1).strip())
+                if path.exists():
+                    subprocess.Popen(f'explorer /select,"{path.resolve()}"')
                 else:
                     messagebox.showwarning("提示", f"文件不存在：\n{path}")
         except Exception:
@@ -346,14 +392,14 @@ class WebpConverterApp:
     def on_closing(self):
         self.config["delete_source"] = self.delete_source.get()
         self.config["cores"] = int(self.cpu_cores.get())
-        self.config["quality"] = self.quality.get() # 保存文字
+        self.config["quality"] = self.quality.get()
         self.config["overwrite"] = self.overwrite.get()
         save_config(self.config)
         self.root.destroy()
 
     def start_conversion(self):
-        if not self.folder_list:
-            messagebox.showwarning("提示", "请先添加至少一个文件夹到任务队列！")
+        if not self.file_queue:
+            messagebox.showwarning("提示", "任务队列为空，请先添加文件！")
             return
             
         if self.is_running: return
@@ -374,39 +420,28 @@ class WebpConverterApp:
 
         self.progress['value'] = 0
 
-        # 将文字质量转换为实际数值
         quality_num = QUALITY_MAP.get(self.quality.get(), 95)
 
         threading.Thread(
             target=self.run_conversion, 
             args=(
-                list(self.folder_list), 
+                list(self.file_queue), 
                 self.delete_source.get(), 
                 int(self.cpu_cores.get()), 
-                quality_num, # 传入数字
+                quality_num,
                 self.overwrite.get()
             ),
             daemon=True
         ).start()
 
-    def run_conversion(self, folders, delete_original, workers, quality_num, overwrite_strategy):
-        all_files = []
-        for folder in folders:
-            root_path = Path(folder)
-            if root_path.is_dir():
-                if not os.access(root_path, os.W_OK) and delete_original:
-                    self.log_error(f"⚠️ 无写入权限，跳过文件夹: {folder}")
-                    continue
-                files = [str(p) for p in root_path.rglob("*") if p.is_file() and p.suffix.lower() == ".webp"]
-                all_files.extend(files)
-
-        if not all_files:
-            self.log_info("未找到任何 .webp 文件。")
+    def run_conversion(self, files: list[Path], delete_original, workers, quality_num, overwrite_strategy):
+        if not files:
+            self.log_info("未找到任何文件。")
             self.finish_conversion(0, 0, 0, cancelled=False)
             return
 
-        self.log_info(f"共找到 {len(all_files)} 个 WebP 文件，准备分批处理...")
-        self.root.after(0, lambda: self.progress.config(maximum=len(all_files)))
+        self.log_info(f"共 {len(files)} 个 WebP 文件，准备分批处理...")
+        self.root.after(0, lambda: self.progress.config(maximum=len(files)))
 
         success_count = 0
         fail_count = 0
@@ -415,13 +450,13 @@ class WebpConverterApp:
         
         batch_size = 500
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            for i in range(0, len(all_files), batch_size):
+            for i in range(0, len(files), batch_size):
                 if self.cancel_event.is_set():
                     cancelled = True
                     break
                 
-                batch_files = all_files[i:i+batch_size]
-                tasks = [(f, delete_original, quality_num, overwrite_strategy) for f in batch_files]
+                batch_files = files[i:i+batch_size]
+                tasks = [(str(f), delete_original, quality_num, overwrite_strategy) for f in batch_files]
                 futures = {executor.submit(convert_single, task): task for task in tasks}
                 
                 for future in as_completed(futures):
@@ -430,12 +465,13 @@ class WebpConverterApp:
                         break
                         
                     src_path_str, dst_path_str, status, err = future.result()
+                    src_path = Path(src_path_str)
                     
                     if status == "success":
-                        self.log_info(f"✓ 成功: {Path(src_path_str).name} -> {Path(dst_path_str).name}")
+                        self.log_info(f"✓ 成功: {src_path.name} -> {Path(dst_path_str).name}")
                         success_count += 1
                     elif status == "skipped":
-                        self.log_info(f"➖ 跳过: {Path(src_path_str).name}")
+                        self.log_info(f"➖ 跳过: {src_path.name}")
                         skip_count += 1
                     else:
                         self.log_error(f"✗ 失败: {src_path_str}\n   原因: {err}\n")
