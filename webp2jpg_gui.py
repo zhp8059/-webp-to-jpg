@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-WebP 批量转 JPG 工具 (全能优化版)
-功能：多核加速、拖拽文件夹、进度条、画质调节、智能覆盖、配置持久化、容错清理、权限占用检测
+WebP 批量转 JPG 工具 (多任务队列/全功能终极版)
+新增：任务队列、取消按钮、双击错误日志打开路径、日志导出、多文件夹拖拽、分批处理
 """
 
 import os
 import sys
 import json
+import re
+import subprocess
 import threading
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -21,7 +23,6 @@ except ImportError:
     messagebox.showerror("缺少依赖", "请先安装 Pillow 库：\npip install Pillow")
     sys.exit(1)
 
-# 尝试导入拖拽库
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
     HAS_DND = True
@@ -30,7 +31,6 @@ except ImportError:
 
 # ================= 配置文件管理 =================
 def get_config_path():
-    """获取配置文件路径，保证在打包后 exe 同目录下生成"""
     if getattr(sys, 'frozen', False):
         base_dir = Path(sys.executable).parent
     else:
@@ -60,12 +60,11 @@ def save_config(config):
 
 # ================= 独立进程转换函数 =================
 def convert_single(args):
-    """在单独进程中执行的转换函数"""
     src_str, delete_original, quality, overwrite_strategy = args
     src = Path(src_str)
     dst = src.with_suffix(".jpg")
     
-    # 1. 智能覆盖策略
+    # 智能覆盖策略
     if dst.exists():
         if overwrite_strategy == "跳过同名文件":
             return (str(src), str(dst), "skipped", "文件已存在，跳过")
@@ -78,9 +77,8 @@ def convert_single(args):
                     break
                 counter += 1
     
-    # 2. 文件占用检测
+    # 文件占用检测
     try:
-        # 尝试以追加模式打开原文件，如果不允许，说明文件被占用
         with open(src, 'a+b') as f:
             pass
     except PermissionError:
@@ -88,7 +86,6 @@ def convert_single(args):
     except Exception as e:
         return (str(src), "", "failed", f"无法访问文件: {str(e)}")
 
-    # 3. 核心转换与清理逻辑
     try:
         with Image.open(src) as im:
             try:
@@ -122,7 +119,7 @@ def convert_single(args):
         if "decoder" in err_msg.lower() or "webp" in err_msg.lower():
             err_msg = f"{err_msg} (可能是损坏或不支持的WebP编码)"
         
-        # 容错：清理残缺文件
+        # 容错清理
         if dst.exists():
             try:
                 dst.unlink()
@@ -135,54 +132,59 @@ def convert_single(args):
 class WebpConverterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("WebP 批量转 JPG 工具 (全能优化版)")
-        self.root.geometry("850x620")
+        self.root.title("WebP 批量转 JPG 工具 (多任务队列终极版)")
+        self.root.geometry("920x720")
         self.root.resizable(False, False)
         
-        # 读取配置
         self.config = load_config()
+        self.folder_list = [] # 任务队列
         
-        self.folder_path = tk.StringVar()
         self.delete_source = tk.BooleanVar(value=self.config.get("delete_source", True))
         self.cpu_cores = tk.StringVar(value=str(self.config.get("cores", multiprocessing.cpu_count())))
         self.quality = tk.StringVar(value=self.config.get("quality", "95"))
         self.overwrite = tk.StringVar(value=self.config.get("overwrite", "覆盖同名文件"))
+        
         self.is_running = False
+        self.cancel_event = threading.Event()
 
         self.create_widgets()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
-        # 1. 文件夹选择区 (支持拖拽)
-        frame_top = tk.Frame(self.root, pady=15)
-        frame_top.pack(fill=tk.X, padx=15)
+        # 1. 任务队列区
+        frame_queue = tk.LabelFrame(self.root, text=" 任务队列 (支持拖拽文件夹到此区域) ", font=("微软雅黑", 10), pady=5, padx=5)
+        frame_queue.pack(fill=tk.X, padx=15, pady=10)
+        
+        self.listbox = tk.Listbox(frame_queue, height=5, font=("微软雅黑", 9), selectmode=tk.EXTENDED)
+        self.listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        
+        scrollbar = tk.Scrollbar(frame_queue, orient="vertical", command=self.listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.config(yscrollcommand=scrollbar.set)
+        
+        # 队列操作按钮
+        frame_queue_btns = tk.Frame(frame_queue)
+        frame_queue_btns.pack(side=tk.RIGHT, fill=tk.Y, padx=5)
+        tk.Button(frame_queue_btns, text="添加文件夹", font=("微软雅黑", 9), width=10, command=self.select_folder).pack(pady=2)
+        tk.Button(frame_queue_btns, text="移除选中", font=("微软雅黑", 9), width=10, command=self.remove_selected).pack(pady=2)
+        tk.Button(frame_queue_btns, text="清空队列", font=("微软雅黑", 9), width=10, command=self.clear_queue).pack(pady=2)
 
-        tk.Label(frame_top, text="目标文件夹:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
-        self.path_entry = tk.Entry(frame_top, textvariable=self.folder_path, width=60, state='readonly', font=("微软雅黑", 10))
-        self.path_entry.pack(side=tk.LEFT, padx=5)
-        
         if HAS_DND:
-            # 注册拖拽事件
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind('<<Drop>>', self.on_drop)
-            tk.Label(frame_top, text="(支持拖拽文件夹)", font=("微软雅黑", 9), fg="gray").pack(side=tk.LEFT, padx=5)
-        
-        tk.Button(frame_top, text="选择文件夹", font=("微软雅黑", 10), command=self.select_folder).pack(side=tk.LEFT)
+            self.listbox.drop_target_register(DND_FILES)
+            self.listbox.dnd_bind('<<Drop>>', self.on_drop)
+            frame_queue.config(text=" 任务队列 (支持拖拽文件夹到此区域) ")
 
         # 2. 选项区
-        frame_mid = tk.Frame(self.root, pady=10)
-        frame_mid.pack(fill=tk.X, padx=15)
-        
-        # 第一行选项
-        row1 = tk.Frame(frame_mid)
+        frame_options = tk.LabelFrame(self.root, text=" 转换设置 ", font=("微软雅黑", 10), pady=5, padx=5)
+        frame_options.pack(fill=tk.X, padx=15, pady=5)
+
+        row1 = tk.Frame(frame_options)
         row1.pack(fill=tk.X, pady=5)
         tk.Checkbutton(row1, text="转换成功后删除源文件", variable=self.delete_source, font=("微软雅黑", 10)).pack(side=tk.LEFT)
         tk.Label(row1, text="  并发核心数:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
-        core_values = [str(i) for i in range(1, multiprocessing.cpu_count() + 1)]
-        ttk.Combobox(row1, textvariable=self.cpu_cores, values=core_values, width=4, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
+        ttk.Combobox(row1, textvariable=self.cpu_cores, values=[str(i) for i in range(1, multiprocessing.cpu_count() + 1)], width=4, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
 
-        # 第二行选项
-        row2 = tk.Frame(frame_mid)
+        row2 = tk.Frame(frame_options)
         row2.pack(fill=tk.X, pady=5)
         tk.Label(row2, text="JPG 质量:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
         ttk.Combobox(row2, textvariable=self.quality, values=["100", "95", "85", "75", "60"], width=5, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
@@ -190,51 +192,74 @@ class WebpConverterApp:
         tk.Label(row2, text="  覆盖策略:", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=(15, 0))
         ttk.Combobox(row2, textvariable=self.overwrite, values=["覆盖同名文件", "跳过同名文件", "重命名保存"], width=12, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
 
-        self.start_btn = tk.Button(row2, text="开始转换", bg="#4CAF50", fg="white", width=15, font=("微软雅黑", 10, "bold"), command=self.start_conversion)
-        self.start_btn.pack(side=tk.RIGHT, padx=10)
+        # 3. 操作区 (进度条 + 按钮)
+        frame_action = tk.Frame(self.root, pady=10)
+        frame_action.pack(fill=tk.X, padx=15)
 
-        # 3. 进度条区
-        frame_progress = tk.Frame(self.root, pady=5)
-        frame_progress.pack(fill=tk.X, padx=15)
-        self.progress = ttk.Progressbar(frame_progress, orient="horizontal", length=100, mode="determinate")
-        self.progress.pack(fill=tk.X)
+        self.progress = ttk.Progressbar(frame_action, orient="horizontal", length=400, mode="determinate")
+        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
 
-        # 4. 日志区域 (左右分栏)
-        frame_bottom = tk.Frame(self.root, pady=10)
+        self.btn_cancel = tk.Button(frame_action, text="取消", bg="#f44336", fg="white", width=8, font=("微软雅黑", 10, "bold"), state=tk.DISABLED, command=self.cancel_conversion)
+        self.btn_cancel.pack(side=tk.RIGHT, padx=5)
+
+        self.btn_start = tk.Button(frame_action, text="开始转换", bg="#4CAF50", fg="white", width=12, font=("微软雅黑", 10, "bold"), command=self.start_conversion)
+        self.btn_start.pack(side=tk.RIGHT, padx=5)
+
+        # 4. 日志区域
+        frame_bottom = tk.Frame(self.root, pady=5)
         frame_bottom.pack(fill=tk.BOTH, expand=True, padx=15)
 
+        # 左侧：运行日志
         frame_left = tk.Frame(frame_bottom)
         frame_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         tk.Label(frame_left, text="运行日志 (成功/进度):", font=("微软雅黑", 10)).pack(anchor=tk.W)
-        self.log_text = scrolledtext.ScrolledText(frame_left, height=15, state='disabled', font=("Consolas", 9))
+        self.log_text = scrolledtext.ScrolledText(frame_left, height=12, state='disabled', font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
+        # 右侧：错误日志
         frame_right = tk.Frame(frame_bottom)
         frame_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
-        tk.Label(frame_right, text="错误日志 (仅记录失败):", font=("微软雅黑", 10), fg="red").pack(anchor=tk.W)
-        self.error_text = scrolledtext.ScrolledText(frame_right, height=15, state='disabled', font=("Consolas", 9), fg="red")
+        
+        frame_right_header = tk.Frame(frame_right)
+        frame_right_header.pack(fill=tk.X)
+        tk.Label(frame_right_header, text="错误日志 (双击打开文件位置):", font=("微软雅黑", 10), fg="red").pack(side=tk.LEFT)
+        tk.Button(frame_right_header, text="导出日志", font=("微软雅黑", 8), command=self.export_logs).pack(side=tk.RIGHT)
+        
+        self.error_text = scrolledtext.ScrolledText(frame_right, height=12, state='disabled', font=("Consolas", 9), fg="red")
         self.error_text.pack(fill=tk.BOTH, expand=True)
+        # 绑定双击事件
+        self.error_text.bind("<Double-Button-1>", self.on_error_double_click)
 
-    # ================= 事件处理 =================
+    # ================= 队列与拖拽操作 =================
     def on_drop(self, event):
-        """处理拖拽文件夹事件"""
         files = self.root.tk.splitlist(event.data)
-        if files:
-            path = files[0]
+        added = 0
+        for path in files:
             if os.path.isdir(path):
-                self.folder_path.set(path)
-            else:
-                messagebox.showwarning("提示", "请拖拽文件夹，而不是文件！")
+                if path not in self.folder_list:
+                    self.folder_list.append(path)
+                    self.listbox.insert(tk.END, path)
+                    added += 1
+        if added > 0:
+            self.log_info(f"已添加 {added} 个文件夹到任务队列")
 
-    def on_closing(self):
-        """关闭窗口时保存配置"""
-        self.config["delete_source"] = self.delete_source.get()
-        self.config["cores"] = int(self.cpu_cores.get())
-        self.config["quality"] = self.quality.get()
-        self.config["overwrite"] = self.overwrite.get()
-        save_config(self.config)
-        self.root.destroy()
+    def select_folder(self):
+        folder = filedialog.askdirectory(title="选择包含 WebP 的文件夹")
+        if folder and folder not in self.folder_list:
+            self.folder_list.append(folder)
+            self.listbox.insert(tk.END, folder)
 
+    def remove_selected(self):
+        selected = self.listbox.curselection()
+        for index in reversed(selected):
+            self.listbox.delete(index)
+            del self.folder_list[index]
+
+    def clear_queue(self):
+        self.listbox.delete(0, tk.END)
+        self.folder_list.clear()
+
+    # ================= 日志与导出 =================
     def log_info(self, message):
         self.root.after(0, lambda: self._log(self.log_text, message))
 
@@ -247,25 +272,71 @@ class WebpConverterApp:
         widget.see(tk.END)
         widget.config(state='disabled')
 
-    def select_folder(self):
-        folder = filedialog.askdirectory(title="选择包含 WebP 的文件夹")
-        if folder:
-            self.folder_path.set(folder)
-
-    def start_conversion(self):
-        folder = self.folder_path.get()
-        if not folder:
-            messagebox.showwarning("提示", "请先选择文件夹！")
-            return
+    def export_logs(self):
+        info_content = self.log_text.get(1.0, tk.END).strip()
+        error_content = self.error_text.get(1.0, tk.END).strip()
         
-        if not os.path.isdir(folder):
-            messagebox.showerror("错误", "目标路径无效！")
+        if not info_content and not error_content:
+            messagebox.showinfo("提示", "当前没有日志可以导出。")
             return
             
-        if not os.access(folder, os.W_OK):
-            messagebox.showerror("权限错误", "目标文件夹没有写入权限，请更换文件夹或以管理员身份运行！")
-            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            title="保存日志",
+            initialfile="webp2jpg_log.txt"
+        )
+        if file_path:
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write("========== 运行日志 ==========\n")
+                    f.write(info_content + "\n\n")
+                    f.write("========== 错误日志 ==========\n")
+                    f.write(error_content + "\n")
+                messagebox.showinfo("成功", "日志已成功导出！")
+            except Exception as e:
+                messagebox.showerror("错误", f"导出日志失败: {e}")
 
+    def on_error_double_click(self, event):
+        """双击错误日志，提取路径并打开文件夹"""
+        try:
+            # 获取点击位置的行索引
+            index = self.error_text.index(f"@{event.x},{event.y}")
+            line_num = int(index.split('.')[0])
+            line_text = self.error_text.get(f"{line_num}.0", f"{line_num}.end")
+            
+            # 正则匹配提取路径 (格式: ✗ 失败: D:\path\to\file.webp)
+            match = re.search(r'✗ 失败: (.*?)(?:\s*$)', line_text)
+            if match:
+                path = match.group(1).strip()
+                path = os.path.normpath(path)
+                if os.path.exists(path):
+                    # 调用资源管理器打开并选中文件
+                    subprocess.Popen(f'explorer /select,"{path}"')
+                else:
+                    messagebox.showwarning("提示", f"文件不存在：\n{path}")
+        except Exception:
+            pass
+
+    # ================= 转换核心逻辑 =================
+    def cancel_conversion(self):
+        self.cancel_event.set()
+        self.btn_cancel.config(state=tk.DISABLED, text="正在取消...")
+        self.log_info("\n⚠️ 收到取消信号，正在停止后续任务，请稍候...")
+
+    def on_closing(self):
+        self.config["delete_source"] = self.delete_source.get()
+        self.config["cores"] = int(self.cpu_cores.get())
+        self.config["quality"] = self.quality.get()
+        self.config["overwrite"] = self.overwrite.get()
+        save_config(self.config)
+        self.root.destroy()
+
+    def start_conversion(self):
+        if not self.folder_list:
+            messagebox.showwarning("提示", "请先添加至少一个文件夹到任务队列！")
+            return
+            
         if self.is_running: return
 
         if self.delete_source.get():
@@ -273,7 +344,9 @@ class WebpConverterApp:
                 return
 
         self.is_running = True
-        self.start_btn.config(state='disabled', text="转换中...")
+        self.cancel_event.clear()
+        self.btn_start.config(state='disabled', text="转换中...")
+        self.btn_cancel.config(state=tk.NORMAL, text="取消")
         
         for widget in [self.log_text, self.error_text]:
             widget.config(state='normal')
@@ -284,69 +357,99 @@ class WebpConverterApp:
 
         threading.Thread(
             target=self.run_conversion, 
-            args=(folder, self.delete_source.get(), int(self.cpu_cores.get()), self.quality.get(), self.overwrite.get()),
+            args=(
+                list(self.folder_list), # 复制一份队列，防止转换过程中用户修改
+                self.delete_source.get(), 
+                int(self.cpu_cores.get()), 
+                self.quality.get(), 
+                self.overwrite.get()
+            ),
             daemon=True
         ).start()
 
-    def run_conversion(self, folder, delete_original, workers, quality, overwrite_strategy):
-        root_path = Path(folder)
-        files = sorted([str(p) for p in root_path.rglob("*") if p.is_file() and p.suffix.lower() == ".webp"])
-        
-        if not files:
+    def run_conversion(self, folders, delete_original, workers, quality, overwrite_strategy):
+        all_files = []
+        for folder in folders:
+            root_path = Path(folder)
+            if root_path.is_dir():
+                # 权限检测
+                if not os.access(root_path, os.W_OK) and delete_original:
+                    self.log_error(f"⚠️ 无写入权限，跳过文件夹: {folder}")
+                    continue
+                files = [str(p) for p in root_path.rglob("*") if p.is_file() and p.suffix.lower() == ".webp"]
+                all_files.extend(files)
+
+        if not all_files:
             self.log_info("未找到任何 .webp 文件。")
-            self.finish_conversion(0, 0, 0)
+            self.finish_conversion(0, 0, 0, cancelled=False)
             return
 
-        self.log_info(f"找到 {len(files)} 个 WebP 文件，开始转换...")
-        self.log_info(f"参数: 质量={quality}, 覆盖策略={overwrite_strategy}, 并发数={workers}\n")
-        
-        # 设置进度条最大值
-        self.root.after(0, lambda: self.progress.config(maximum=len(files)))
+        self.log_info(f"共找到 {len(all_files)} 个 WebP 文件，准备分批处理...")
+        self.root.after(0, lambda: self.progress.config(maximum=len(all_files)))
 
         success_count = 0
         fail_count = 0
         skip_count = 0
-        tasks = [(f, delete_original, quality, overwrite_strategy) for f in files]
-
+        cancelled = False
+        
+        # 分批处理，防止内存溢出 (每批 500 个)
+        batch_size = 500
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(convert_single, task): task for task in tasks}
+            for i in range(0, len(all_files), batch_size):
+                if self.cancel_event.is_set():
+                    cancelled = True
+                    break
+                
+                batch_files = all_files[i:i+batch_size]
+                tasks = [(f, delete_original, quality, overwrite_strategy) for f in batch_files]
+                futures = {executor.submit(convert_single, task): task for task in tasks}
+                
+                for future in as_completed(futures):
+                    if self.cancel_event.is_set():
+                        cancelled = True
+                        break
+                        
+                    src_path_str, dst_path_str, status, err = future.result()
+                    
+                    if status == "success":
+                        self.log_info(f"✓ 成功: {Path(src_path_str).name} -> {Path(dst_path_str).name}")
+                        success_count += 1
+                    elif status == "skipped":
+                        self.log_info(f"➖ 跳过: {Path(src_path_str).name}")
+                        skip_count += 1
+                    else:
+                        self.log_error(f"✗ 失败: {src_path_str}\n   原因: {err}\n")
+                        fail_count += 1
+                    
+                    self.root.after(0, lambda: self.progress.step(1))
+
+                if cancelled:
+                    # 取消剩余未开始的任务
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+
+        self.finish_conversion(success_count, fail_count, skip_count, cancelled)
+
+    def finish_conversion(self, success, fail, skip, cancelled):
+        if cancelled:
+            self.log_info(f"\n⚠️ 转换已被用户取消。已完成：成功 {success} 个，失败 {fail} 个，跳过 {skip} 个。")
+        else:
+            self.log_info(f"\n处理完成：成功 {success} 个，失败 {fail} 个，跳过 {skip} 个。")
             
-            for future in as_completed(futures):
-                src_path_str, dst_path_str, status, err = future.result()
-                
-                if status == "success":
-                    self.log_info(f"✓ 成功: {Path(src_path_str).name} -> {Path(dst_path_str).name}")
-                    success_count += 1
-                elif status == "skipped":
-                    self.log_info(f"➖ 跳过: {Path(src_path_str).name} ({err})")
-                    skip_count += 1
-                else:
-                    self.log_error(f"✗ 失败: {src_path_str}\n   原因: {err}\n")
-                    fail_count += 1
-                
-                # 更新进度条
-                self.root.after(0, lambda: self.progress.step(1))
-
-        self.finish_conversion(success_count, fail_count, skip_count)
-
-    def finish_conversion(self, success, fail, skip):
-        self.log_info(f"\n处理完成：成功 {success} 个，失败 {fail} 个，跳过 {skip} 个。")
         if fail > 0:
             self.log_info("⚠️ 有文件转换失败，请查看右侧【错误日志】排查原因。")
             
-        self.root.after(0, lambda: self.start_btn.config(state='normal', text="开始转换"))
+        self.root.after(0, lambda: self.btn_start.config(state='normal', text="开始转换"))
+        self.root.after(0, lambda: self.btn_cancel.config(state=tk.DISABLED, text="取消"))
         self.is_running = False
-        self.root.after(0, lambda: messagebox.showinfo("完成", f"转换完成！\n成功: {success} 个\n失败: {fail} 个\n跳过: {skip} 个"))
+        self.root.after(0, lambda: messagebox.showinfo("完成", f"转换结束！\n成功: {success} 个\n失败: {fail} 个\n跳过: {skip} 个"))
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    # 优先使用带拖拽功能的根窗口
     if HAS_DND:
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
-        # 如果没有安装拖拽库，弹窗提示（但不影响使用）
-        root.after(100, lambda: messagebox.showinfo("提示", "未检测到 tkinterdnd2 库，拖拽功能不可用。\n如需使用拖拽，请执行: pip install tkinterdnd2"))
-        
+        root.after(100, lambda: messagebox.showinfo("提示", "未检测到 tkinterdnd2 库，拖拽功能不可用。"))
     app = WebpConverterApp(root)
     root.mainloop()
