@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-通用图片格式转换工具 (终极版 - 支持多格式输入与多格式输出)
+通用图片格式转换工具 (终极版 - 无损格式禁用质量选项)
 """
 
 import sys
@@ -82,7 +82,6 @@ def convert_single(args):
     src_str, delete_original, quality_num, overwrite_strategy, target_format = args
     src = Path(src_str)
     
-    # 动态决定后缀名
     ext = ".jpg" if target_format.upper() == "JPG" else f".{target_format.lower()}"
     dst = src.with_suffix(ext)
     
@@ -118,7 +117,6 @@ def convert_single(args):
             im.load()
             icc = im.info.get("icc_profile")
 
-            # 透明背景处理（仅当转换为不支持透明的格式时）
             if target_format.upper() in ["JPG", "JPEG", "BMP"]:
                 if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
                     im = im.convert("RGBA")
@@ -128,16 +126,20 @@ def convert_single(args):
                 else:
                     im = im.convert("RGB")
             else:
-                # PNG, WEBP 支持透明
                 if im.mode not in ("RGBA", "RGB", "L"):
                     im = im.convert("RGBA")
 
-            # 构建保存参数
-            save_kwargs = {"format": target_format.upper()}
-            if target_format.upper() in ["JPG", "JPEG", "WEBP"]:
+            # 格式映射与保存参数构建
+            pillow_format = "JPEG" if target_format.upper() == "JPG" else target_format.upper()
+            save_kwargs = {"format": pillow_format}
+            
+            # 只有有损格式才传质量参数
+            if pillow_format in ["JPEG", "WEBP"]:
                 save_kwargs["quality"] = int(quality_num)
                 save_kwargs["optimize"] = True
-            if icc and target_format.upper() in ["JPG", "JPEG", "WEBP"]:
+            # PNG 和 BMP 忽略质量参数，使用默认压缩
+
+            if icc and pillow_format in ["JPEG", "WEBP"]:
                 save_kwargs["icc_profile"] = icc
                 
             im.save(dst, **save_kwargs)
@@ -149,14 +151,11 @@ def convert_single(args):
         
     except Exception as e:
         err_msg = str(e)
-        
-        # 容错清理
         if dst.exists():
             try:
                 dst.unlink()
             except Exception:
                 pass
-        
         return (str(src), "", "failed", err_msg)
 
 # ================= GUI 主程序 =================
@@ -182,7 +181,7 @@ class UniversalConverterApp:
         self.overwrite = tk.StringVar(value=self.config.get("overwrite", "覆盖同名文件"))
 
         self.create_widgets()
-        self.update_quality_state() # 初始化时根据格式刷新质量下拉框状态
+        self.update_quality_state() # 初始化时根据格式刷新状态
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def create_widgets(self):
@@ -213,7 +212,6 @@ class UniversalConverterApp:
         frame_options = tk.LabelFrame(self.root, text=" 转换设置 ", font=("微软雅黑", 10), pady=5, padx=5)
         frame_options.pack(fill=tk.X, padx=15, pady=5)
 
-        # 第一行：输出格式、删除源文件、核心数
         row1 = tk.Frame(frame_options)
         row1.pack(fill=tk.X, pady=5)
         
@@ -226,7 +224,6 @@ class UniversalConverterApp:
         tk.Label(row1, text="  并发核心数:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
         ttk.Combobox(row1, textvariable=self.cpu_cores, values=[str(i) for i in range(1, multiprocessing.cpu_count() + 1)], width=4, state="readonly", font=("微软雅黑", 10)).pack(side=tk.LEFT, padx=5)
 
-        # 第二行：质量、覆盖策略
         row2 = tk.Frame(frame_options)
         row2.pack(fill=tk.X, pady=5)
         tk.Label(row2, text="质量:", font=("微软雅黑", 10)).pack(side=tk.LEFT)
@@ -281,6 +278,7 @@ class UniversalConverterApp:
         if fmt in ["JPG", "WEBP"]:
             self.quality_combo.config(state="readonly")
         else:
+            # PNG 和 BMP 是（或接近）无损格式，不需要选择有损质量
             self.quality_combo.config(state="disabled")
 
     def on_format_change(self, event=None):
@@ -310,7 +308,6 @@ class UniversalConverterApp:
             self.add_paths_to_queue(files_to_add)
 
     def select_paths(self):
-        # 支持选择多种格式
         filetypes = [("图片文件", " ".join(f"*{ext}" for ext in SUPPORTED_INPUT_EXTENSIONS)), ("所有文件", "*.*")]
         files = filedialog.askopenfilenames(title="选择图片文件", filetypes=filetypes)
         if files:
@@ -362,8 +359,7 @@ class UniversalConverterApp:
             orig_size_kb = src_path.stat().st_size / 1024
 
             im_sim = img_orig.copy()
-            # 透明处理逻辑
-            if target_format in ["JPG", "BMP"]:
+            if target_format in ["JPG", "JPEG", "BMP"]:
                 if im_sim.mode in ("RGBA", "LA") or (im_sim.mode == "P" and "transparency" in im_sim.info):
                     im_sim = im_sim.convert("RGBA")
                     bg = Image.new("RGB", im_sim.size, (255, 255, 255))
@@ -375,9 +371,11 @@ class UniversalConverterApp:
                 if im_sim.mode not in ("RGBA", "RGB", "L"):
                     im_sim = im_sim.convert("RGBA")
 
+            pillow_format = "JPEG" if target_format == "JPG" else target_format
             buffer = io.BytesIO()
-            save_kwargs = {"format": target_format}
-            if target_format in ["JPG", "WEBP"]:
+            save_kwargs = {"format": pillow_format}
+            
+            if pillow_format in ["JPEG", "WEBP"]:
                 quality_num = QUALITY_MAP.get(self.quality.get(), 95)
                 save_kwargs["quality"] = int(quality_num)
                 save_kwargs["optimize"] = True
