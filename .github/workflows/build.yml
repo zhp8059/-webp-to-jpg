@@ -25,10 +25,10 @@ jobs:
 
       - name: 打包 exe
         run: |
-          pyinstaller --onefile --name webp2jpg --clean webp2jpg.py
+          pyinstaller --onefile --noconsole --name WebP转JPG工具 --clean --collect-all PIL --hidden-import PIL._webp webp2jpg_gui.py
 
       - name: 上传 exe
         uses: actions/upload-artifact@v4
         with:
           name: webp2jpg-windows-exe
-          path: dist/webp2jpg.exe
+          path: dist/WebP转JPG工具.exe
