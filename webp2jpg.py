@@ -1,98 +1,158 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-批量将文件夹中的 WebP 图片转换为 JPG。
-
-用法示例:
-    python webp2jpg.py ./images
-    python webp2jpg.py ./images -q 90
-    python webp2jpg.py ./images --no-recursive --delete
+WebP 批量转 JPG 工具 (带图形界面)
+功能：
+1. 可视化选择文件夹
+2. 批量将 WebP 转换为 JPG
+3. 自动处理透明背景（转为白色）
+4. 默认转换成功后删除源 WebP 文件（可在界面取消勾选）
 """
 
-import argparse
-import sys
+import os
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext
 from pathlib import Path
 
 try:
     from PIL import Image
 except ImportError:
-    sys.exit("缺少 Pillow 库，请先运行：pip install Pillow")
+    messagebox.showerror("缺少依赖", "请先安装 Pillow 库：\npip install Pillow")
+    exit(1)
 
+class WebpConverterApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("WebP 批量转 JPG 工具")
+        self.root.geometry("600x450")
+        self.root.resizable(False, False)
+        
+        self.folder_path = tk.StringVar()
+        self.delete_source = tk.BooleanVar(value=True) # 默认勾选删除源文件
+        self.is_running = False
 
-def convert_one(src: Path, quality: int, delete_original: bool) -> bool:
-    """转换单个文件，返回是否成功。"""
-    dst = src.with_suffix(".jpg")
+        self.create_widgets()
 
-    if dst.exists():
-        print(f"跳过（已存在）: {dst.name}")
-        return False
+    def create_widgets(self):
+        # 1. 文件夹选择区
+        frame_top = tk.Frame(self.root, pady=10)
+        frame_top.pack(fill=tk.X, padx=10)
 
-    try:
-        with Image.open(src) as im:
-            im.load()
-            icc = im.info.get("icc_profile")
+        tk.Label(frame_top, text="目标文件夹:").pack(side=tk.LEFT)
+        tk.Entry(frame_top, textvariable=self.folder_path, width=40, state='readonly').pack(side=tk.LEFT, padx=5)
+        tk.Button(frame_top, text="选择文件夹", command=self.select_folder).pack(side=tk.LEFT)
 
-            # JPG 不支持透明通道，需要把透明部分合成到白色背景上
-            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
-                im = im.convert("RGBA")
-                bg = Image.new("RGB", im.size, (255, 255, 255))
-                bg.paste(im, mask=im.split()[-1])  # 用 alpha 通道做蒙版
-                im = bg
-            else:
-                im = im.convert("RGB")
+        # 2. 选项区
+        frame_mid = tk.Frame(self.root, pady=5)
+        frame_mid.pack(fill=tk.X, padx=10)
+        
+        tk.Checkbutton(frame_mid, text="转换成功后删除源 WebP 文件", variable=self.delete_source).pack(side=tk.LEFT)
+        self.start_btn = tk.Button(frame_mid, text="开始转换", bg="#4CAF50", fg="white", width=15, command=self.start_conversion)
+        self.start_btn.pack(side=tk.RIGHT)
 
-            save_kwargs = {
-                "format": "JPEG",
-                "quality": quality,
-                "optimize": True,
-                "progressive": True,
-            }
-            if icc:
-                save_kwargs["icc_profile"] = icc
+        # 3. 日志输出区
+        frame_bottom = tk.Frame(self.root, pady=10)
+        frame_bottom.pack(fill=tk.BOTH, expand=True, padx=10)
+        
+        tk.Label(frame_bottom, text="转换日志:").pack(anchor=tk.W)
+        self.log_text = scrolledtext.ScrolledText(frame_bottom, height=15, state='disabled')
+        self.log_text.pack(fill=tk.BOTH, expand=True)
 
-            im.save(dst, **save_kwargs)
+    def log(self, message):
+        """线程安全的日志输出"""
+        self.root.after(0, self._log, message)
 
-        if delete_original:
-            src.unlink()
+    def _log(self, message):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
 
-        print(f"✓ {src.name}  ->  {dst.name}")
-        return True
+    def select_folder(self):
+        folder = filedialog.askdirectory(title="选择包含 WebP 的文件夹")
+        if folder:
+            self.folder_path.set(folder)
 
-    except Exception as e:
-        print(f"✗ 转换失败 {src}: {e}")
-        return False
+    def start_conversion(self):
+        folder = self.folder_path.get()
+        if not folder:
+            messagebox.showwarning("提示", "请先选择文件夹！")
+            return
+        
+        if self.is_running:
+            return
 
+        # 二次确认，防止误删
+        if self.delete_source.get():
+            confirm = messagebox.askyesno("危险操作确认", 
+                "您勾选了【转换成功后删除源文件】。\n\n请确认目标文件夹内的图片已经备份，或您不需要保留原图。\n是否继续？")
+            if not confirm:
+                return
 
-def main():
-    parser = argparse.ArgumentParser(description="批量把 WebP 转换成 JPG")
-    parser.add_argument("folder", help="存放 WebP 文件的文件夹路径")
-    parser.add_argument("-q", "--quality", type=int, default=95,
-                        help="JPG 质量 1-100，默认 95")
-    parser.add_argument("-r", "--no-recursive", action="store_true",
-                        help="只处理当前文件夹，不递归子文件夹")
-    parser.add_argument("-d", "--delete", action="store_true",
-                        help="转换成功后删除原 WebP 文件")
-    args = parser.parse_args()
+        self.is_running = True
+        self.start_btn.config(state='disabled', text="转换中...")
+        self.log_text.config(state='normal')
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state='disabled')
 
-    root = Path(args.folder).expanduser().resolve()
-    if not root.is_dir():
-        sys.exit(f"错误：{root} 不是有效文件夹")
+        # 开启新线程运行，防止界面卡死
+        threading.Thread(target=self.run_conversion, args=(folder, self.delete_source.get()), daemon=True).start()
 
-    # 收集所有 .webp 文件（后缀大小写不敏感）
-    iterator = root.glob("*") if args.no_recursive else root.rglob("*")
-    files = sorted(
-        p for p in iterator
-        if p.is_file() and p.suffix.lower() == ".webp"
-    )
+    def run_conversion(self, folder, delete_original):
+        root_path = Path(folder)
+        files = sorted([p for p in root_path.rglob("*") if p.is_file() and p.suffix.lower() == ".webp"])
+        
+        if not files:
+            self.log("未找到任何 .webp 文件。")
+            self.finish_conversion(0, 0)
+            return
 
-    if not files:
-        print("未找到任何 .webp 文件")
-        return
+        self.log(f"找到 {len(files)} 个 WebP 文件，开始转换...\n")
+        success_count = 0
+        fail_count = 0
 
-    print(f"找到 {len(files)} 个 WebP 文件，开始转换...\n")
-    ok = sum(convert_one(f, args.quality, args.delete) for f in files)
-    print(f"\n完成：成功 {ok} 个，失败/跳过 {len(files) - ok} 个")
+        for src in files:
+            dst = src.with_suffix(".jpg")
+            try:
+                with Image.open(src) as im:
+                    im.load()
+                    icc = im.info.get("icc_profile")
 
+                    # 处理透明通道
+                    if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                        im = im.convert("RGBA")
+                        bg = Image.new("RGB", im.size, (255, 255, 255))
+                        bg.paste(im, mask=im.split()[-1])
+                        im = bg
+                    else:
+                        im = im.convert("RGB")
+
+                    # 保存为 JPG
+                    save_kwargs = {"format": "JPEG", "quality": 95, "optimize": True}
+                    if icc:
+                        save_kwargs["icc_profile"] = icc
+                    im.save(dst, **save_kwargs)
+
+                # 删除源文件
+                if delete_original:
+                    src.unlink()
+
+                self.log(f"✓ 成功: {src.name} -> {dst.name}")
+                success_count += 1
+
+            except Exception as e:
+                self.log(f"✗ 失败: {src.name} | 错误: {str(e)}")
+                fail_count += 1
+
+        self.finish_conversion(success_count, fail_count)
+
+    def finish_conversion(self, success, fail):
+        self.log(f"\n处理完成：成功 {success} 个，失败 {fail} 个。")
+        self.root.after(0, lambda: self.start_btn.config(state='normal', text="开始转换"))
+        self.is_running = False
+        self.root.after(0, lambda: messagebox.showinfo("完成", f"转换完成！\n成功: {success} 个\n失败: {fail} 个"))
 
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = WebpConverterApp(root)
+    root.mainloop()
