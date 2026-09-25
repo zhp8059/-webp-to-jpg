@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-WebP 批量转 JPG 工具 (带图形界面、多核加速、独立错误日志、容错版)
+WebP 批量转 JPG 工具 (带图形界面、多核加速、独立错误日志、显示完整路径版)
 """
 
 import os
@@ -55,13 +55,15 @@ def convert_single(args):
         if delete_original:
             src.unlink()
 
-        return (src.name, dst.name, True, "")
+        # 成功时返回完整路径和文件名，方便后续处理
+        return (str(src), str(dst), True, "")
     except Exception as e:
         err_msg = str(e)
         # 针对 WebP 解码错误给出更友好的提示
         if "decoder" in err_msg.lower() or "webp" in err_msg.lower():
             err_msg = f"{err_msg} (可能是文件损坏、采用了不支持的WebP编码，或是一个动画WebP)"
-        return (src.name, "", False, err_msg)
+        # 失败时也返回完整路径
+        return (str(src), "", False, err_msg)
 
 # ================= GUI 主程序 =================
 class WebpConverterApp:
@@ -197,13 +199,15 @@ class WebpConverterApp:
             futures = {executor.submit(convert_single, task): task for task in tasks}
             
             for future in as_completed(futures):
-                src_name, dst_name, success, err = future.result()
+                # 这里接收到的 src_path_str 已经是绝对路径了
+                src_path_str, dst_path_str, success, err = future.result()
                 if success:
-                    self.log_info(f"✓ 成功: {src_name} -> {dst_name}")
+                    # 成功时只显示文件名，保持左侧日志清爽
+                    self.log_info(f"✓ 成功: {Path(src_path_str).name} -> {Path(dst_path_str).name}")
                     success_count += 1
                 else:
-                    # 将错误信息发往专用的错误日志框，并带上文件名
-                    error_msg = f"✗ 失败: {src_name}\n   原因: {err}\n"
+                    # 错误时显示完整路径，方便在电脑中定位
+                    error_msg = f"✗ 失败: {src_path_str}\n   原因: {err}\n"
                     self.log_error(error_msg)
                     fail_count += 1
 
